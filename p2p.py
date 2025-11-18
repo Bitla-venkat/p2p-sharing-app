@@ -8,6 +8,7 @@ import json
 import queue
 import hashlib
 import sys
+import time  # Added for bandwidth control
 
 # Use 'Cryptodome' which is what you have installed (from pycryptodomex)
 from Cryptodome.Cipher import AES
@@ -37,7 +38,7 @@ class FileTransferApp:
     def __init__(self, master):
         self.master = master
         self.master.title("Secure LAN File Transfer")
-        self.master.geometry("600x650")
+        self.master.geometry("600x700")  # Slightly taller for new UI element
 
         # Style
         self.style = ttk.Style()
@@ -98,7 +99,7 @@ class FileTransferApp:
         self.peer_list_label = ttk.Label(self.send_tab, text="Discovered Peers:")
         self.peer_list_label.pack(fill='x', pady=(5,0))
         
-        self.peer_listbox = tk.Listbox(self.send_tab, height=5, bg='#4A4A4A', fg='#E0E0E0', highlightthickness=0, borderwidth=1, relief='solid')
+        self.peer_listbox = tk.Listbox(self.send_tab, height=4, bg='#4A4A4A', fg='#E0E0E0', highlightthickness=0, borderwidth=1, relief='solid')
         self.peer_listbox.pack(fill='x', pady=5)
         self.peer_listbox.bind('<<ListboxSelect>>', self.on_peer_select)
         
@@ -132,6 +133,20 @@ class FileTransferApp:
         self.send_password_entry = ttk.Entry(password_frame, show="*")
         self.send_password_entry.pack(side='left', fill='x', expand=True)
 
+        # --- Bandwidth Control (NEW) ---
+        bw_frame = ttk.Frame(self.send_tab)
+        bw_frame.pack(fill='x', pady=5)
+
+        bw_label = ttk.Label(bw_frame, text="Max Speed (KB/s):")
+        bw_label.pack(side='left', padx=(0, 10))
+        
+        # Default to 0 (Unlimited)
+        self.speed_limit_entry = ttk.Entry(bw_frame)
+        self.speed_limit_entry.insert(0, "0")
+        self.speed_limit_entry.pack(side='left', fill='x', expand=True)
+        
+        ttk.Label(bw_frame, text="(0 = Unlimited)").pack(side='left', padx=(5, 0))
+
         # --- Send Button ---
         self.send_button = ttk.Button(self.send_tab, text="Send File", state="disabled", command=self.start_send_thread)
         self.send_button.pack(fill='x', ipady=10, pady=10)
@@ -140,7 +155,7 @@ class FileTransferApp:
         log_label = ttk.Label(self.send_tab, text="Send Status:")
         log_label.pack(fill='x', pady=(5,0))
         
-        self.send_status_log = scrolledtext.ScrolledText(self.send_tab, height=8, width=70, state='disabled', bg='#4A4A4A', fg='#E0E0E0')
+        self.send_status_log = scrolledtext.ScrolledText(self.send_tab, height=6, width=70, state='disabled', bg='#4A4A4A', fg='#E0E0E0')
         self.send_status_log.pack(fill='both', expand=True, pady=5)
 
     def create_receive_tab(self):
@@ -315,6 +330,14 @@ class FileTransferApp:
         target_ip = self.target_ip_entry.get()
         password = self.send_password_entry.get()
         filepath = self.selected_filepath
+        
+        # Parse speed limit
+        speed_limit_kb = 0
+        try:
+            speed_limit_kb = float(self.speed_limit_entry.get())
+        except ValueError:
+            self.log_queue.put((self.send_status_log, "Invalid speed limit. Using Unlimited."))
+            speed_limit_kb = 0
 
         if not target_ip or not password or not filepath:
             self.log_queue.put((self.send_status_log, "Error: IP, password, and file must be set."))
@@ -330,6 +353,8 @@ class FileTransferApp:
         f = None
         try:
             log(f"Starting to send {filename}...")
+            if speed_limit_kb > 0:
+                log(f"Rate limited to {speed_limit_kb} KB/s")
             
             # 1. Derive key
             log("1. Deriving encryption key...")
@@ -363,7 +388,13 @@ class FileTransferApp:
             log("4. Encrypting and sending file...")
             f = open(filepath, 'rb')
             bytes_sent = 0
+            
+            # Rate limiting calculation
+            bytes_per_sec_limit = speed_limit_kb * 1024
+            
             while True:
+                chunk_start_time = time.time()
+                
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break # End of file
@@ -371,7 +402,21 @@ class FileTransferApp:
                 encrypted_chunk = cipher.encrypt(chunk)
                 sock.sendall(encrypted_chunk)
                 
-                bytes_sent += len(chunk)
+                bytes_sent += len(chunk) # Use original length for progress
+                
+                # --- Bandwidth Control ---
+                if bytes_per_sec_limit > 0:
+                    # Calculate how long this chunk SHOULD take
+                    expected_duration = len(chunk) / bytes_per_sec_limit
+                    
+                    # Calculate how long it ACTUALLY took
+                    elapsed = time.time() - chunk_start_time
+                    
+                    # If we were too fast, sleep the difference
+                    if elapsed < expected_duration:
+                        time.sleep(expected_duration - elapsed)
+                # -------------------------
+
                 log(f"   Sent {bytes_sent * 100 / filesize:.2f}%")
 
             # 7. Finalize encryption and send tag
